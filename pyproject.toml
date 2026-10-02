@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tcg-order-printer-helper"
+version = "1.0.0"
+description = "Local print helper for the TCG Order Printer browser extension"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = [
+  "pdfplumber==0.11.10",
+  "pypdf==6.19.0",
+  "reportlab==5.0.1",
+]
+
+[project.scripts]
+tcg-order-printer-helper = "tcg_order_printer_helper.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
