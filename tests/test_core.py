@@ -30,6 +30,21 @@ class ParseTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError,'exactly one order'):
                     core.parse(self.write(slip(((ORDER_A+suffix,1),))))
 
+    def test_malformed_order_field_cannot_hide_beside_a_valid_field(self):
+        malformed=[ORDER_B+suffix for suffix in ('X','1','-EXTRA','_EXTRA','é','!')]
+        malformed.extend(('',ORDER_B[:-1],'INVALID'))
+        for invalid in malformed:
+            for header,footer in ((invalid,ORDER_A),(ORDER_A,invalid)):
+                with self.subTest(header=header,footer=footer):
+                    with self.assertRaisesRegex(ValueError,'exactly one order'):
+                        core.parse(self.write(slip(header_order=header,footer_order=footer)))
+
+    def test_order_fields_must_agree_after_case_normalization(self):
+        groups=core.parse(self.write(slip(((ORDER_A,2),),header_order=ORDER_A.lower())))
+        self.assertEqual([(g['id'],g['pages']) for g in groups],[(ORDER_A,[0,1])])
+        with self.assertRaisesRegex(ValueError,'exactly one order'):
+            core.parse(self.write(slip(header_order=ORDER_B)))
+
     def test_invalid_page_count_does_not_allocate_declared_pages(self):
         source=self.write(slip(declared_total=100000))
         tracing=tracemalloc.is_tracing()

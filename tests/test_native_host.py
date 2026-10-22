@@ -69,6 +69,24 @@ class HostTest(unittest.TestCase):
         self.assertEqual(out,[{'ok':False,'error':'UNSUPPORTED_PACKING_SLIP'}])
         self.mocks[1].assert_not_called()
 
+    def test_malformed_order_field_with_valid_requested_field_cannot_print(self):
+        for invalid in (ORDER_B+'X',ORDER_B+'-EXTRA',ORDER_B+'é','',ORDER_B[:-1]):
+            for header,footer in ((invalid,ORDER_A),(ORDER_A,invalid)):
+                with self.subTest(header=header,footer=footer):
+                    data=slip(header_order=header,footer_order=footer)
+                    code,out=self.serve(self.print_message(data))
+                    self.assertEqual(code,0)
+                    self.assertEqual(out,[{'ok':False,'error':'UNSUPPORTED_PACKING_SLIP'}])
+                    self.mocks[1].assert_not_called()
+                    self.assertFalse((self.state/'labels').exists())
+
+    def test_valid_multi_page_order_with_repeated_fields_prints(self):
+        code,out=self.serve(self.print_message(slip(((ORDER_A,2),))))
+        self.assertEqual(code,0)
+        self.assertEqual((out[0]['ok'],out[0]['state'],out[0]['orderId'],out[0]['pages']),
+                         (True,'completed',ORDER_A,3))
+        self.mocks[1].assert_called_once()
+
     def test_invalid_json_and_utf8_allow_the_next_complete_frame(self):
         for raw in (b'{',b'\xff'):
             with self.subTest(raw=raw):

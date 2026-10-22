@@ -7,7 +7,8 @@ from reportlab.pdfgen import canvas
 from reportlab.pdfbase.pdfmetrics import stringWidth
 
 DEFAULT_STATE = Path.home() / 'Library/Application Support/TCGOrderPrinter'
-ORDER = re.compile(r'Order\s*Number\s*:\s*([A-Z0-9]{8}-[A-Z0-9]{6}-[A-Z0-9]{5})(?![\w-])', re.I)
+ORDER_FIELD = re.compile(r'Order\s*Number\s*:\s*(\S*)', re.I)
+ORDER_ID = re.compile(r'[A-Z0-9]{8}-[A-Z0-9]{6}-[A-Z0-9]{5}', re.I | re.ASCII)
 PAGINATION = re.compile(r'Page\s*(\d+)\s*of\s*(\d+)', re.I)
 CITY = re.compile(r'^.+,\s*[A-Z]{2}\s+\d{5}(?:-\d{4})?$')
 # 4x6 in label media, in PDF points.
@@ -70,7 +71,7 @@ def address(page):
     result = lines[:city+1]
     if len(lines)>city+1 and lines[city+1].upper() in {'UNITED STATES','UNITED STATES OF AMERICA','USA','US'}:
         result.append(lines[city+1])
-    if any(ORDER.search(s) or 'Quantity' in s or 'Shipping Method' in s for s in result):
+    if any(ORDER_FIELD.search(s) or 'Quantity' in s or 'Shipping Method' in s for s in result):
         raise ValueError('Address block contains non-address text')
     return result
 
@@ -83,10 +84,15 @@ def parse(path):
     with pdfplumber.open(path) as pdf:
         for index,page in enumerate(pdf.pages):
             text = page.extract_text(x_tolerance=.5) or ''
-            ids = set(ORDER.findall(text))
+            # Capture every field before validation: a malformed header must not
+            # disappear just because another field contains a valid order ID.
+            fields = ORDER_FIELD.findall(text)
+            if any(not ORDER_ID.fullmatch(value) for value in fields):
+                raise ValueError(f'Page {index+1} does not identify exactly one order')
+            ids = {value.upper() for value in fields}
             if len(ids)!=1:
                 raise ValueError(f'Page {index+1} does not identify exactly one order')
-            oid = ids.pop().upper()
+            oid = ids.pop()
             pg = PAGINATION.findall(text)
             if len(pg)!=1:
                 raise ValueError(f'Page {index+1} does not identify its native page count')
