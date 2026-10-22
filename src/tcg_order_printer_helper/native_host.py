@@ -1,5 +1,6 @@
 """Browser stdio native host; accepts only official PDF bytes from allowed extensions."""
 import base64, contextlib, hashlib, json, os, re, struct, sys, time, uuid
+from pdfplumber.utils.exceptions import PdfminerException
 from . import __version__, core
 
 HOST_NAME='io.github.llrhook.tcg_order_printer'
@@ -31,6 +32,8 @@ def handle(message,state=core.DEFAULT_STATE):
     if command!='print': raise Rejected('UNSUPPORTED_COMMAND')
     oid=message.get('orderId','');token=message.get('requestId','')
     if not isinstance(oid,str) or not ORDER.fullmatch(oid) or not isinstance(token,str) or not TOKEN.fullmatch(token): raise Rejected('INVALID_ORDER_REQUEST')
+    try: token=str(uuid.UUID(token))
+    except ValueError: raise Rejected('INVALID_ORDER_REQUEST')
     # No path is accepted for live printing. Byte transport avoids Downloads
     # filesystem permissions and arbitrary local-file access entirely.
     data=message.get('pdfBase64')
@@ -38,7 +41,6 @@ def handle(message,state=core.DEFAULT_STATE):
     try: raw=base64.b64decode(data,validate=True)
     except ValueError: raise Rejected('INVALID_PDF_ENCODING')
     if not raw.startswith(b'%PDF-') or len(raw)>MAX_PDF or b'%%EOF' not in raw[-1024:]: raise Rejected('INVALID_OR_INCOMPLETE_PDF')
-    token=str(uuid.UUID(token))
     sha=hashlib.sha256(raw).hexdigest()
     core.prune(state,conf['retention_days'])
     incoming=state/'inputs';incoming.mkdir(parents=True,exist_ok=True,mode=0o700)
@@ -52,7 +54,7 @@ def handle(message,state=core.DEFAULT_STATE):
         finally:
             if temporary.exists():temporary.unlink()
     try: groups=core.parse(source)
-    except ValueError: raise Rejected('UNSUPPORTED_PACKING_SLIP')
+    except (ValueError,PdfminerException): raise Rejected('UNSUPPORTED_PACKING_SLIP')
     if [g['id'] for g in groups]!=[oid]: raise Rejected('PDF_ORDER_MISMATCH')
     pages=sum(len(g['pages'])+1 for g in groups)
     output=state/'labels'/f'{oid}-{sha[:16]}-{token[:8]}.pdf'
@@ -97,10 +99,11 @@ def serve(origin,stdin=None,stdout=None,state=core.DEFAULT_STATE):
         try:
             header=inp.read(4)
             if not header:return 0
-            if len(header)!=4:raise EOFError
+            header+=read_exact(inp,4-len(header))
             length=struct.unpack('=I',header)[0]
             if not 0<length<=MAX_MESSAGE:raise Rejected('MESSAGE_TOO_LARGE')
-            message=json.loads(read_exact(inp,length).decode('utf-8'))
+            try: message=json.loads(read_exact(inp,length).decode('utf-8'))
+            except (UnicodeDecodeError,json.JSONDecodeError): raise Rejected('INVALID_MESSAGE')
             result=handle(message,state)
         except EOFError:return 1
         except Rejected as error:result={'ok':False,'error':str(error)}

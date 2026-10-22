@@ -1,5 +1,5 @@
 """Native TCGplayer packing slip + matched address label, submitted to CUPS."""
-import collections, contextlib, datetime, hashlib, http.client, io, json, os, re, socket, sqlite3, struct, subprocess, time, uuid
+import collections, contextlib, datetime, hashlib, http.client, io, json, os, re, socket, sqlite3, struct, subprocess, tempfile, time, uuid
 from pathlib import Path
 import pdfplumber
 from pypdf import PdfReader, PdfWriter, Transformation
@@ -7,7 +7,8 @@ from reportlab.pdfgen import canvas
 from reportlab.pdfbase.pdfmetrics import stringWidth
 
 DEFAULT_STATE = Path.home() / 'Library/Application Support/TCGOrderPrinter'
-ORDER = re.compile(r'Order\s*Number\s*:\s*([A-Z0-9]{8}-[A-Z0-9]{6}-[A-Z0-9]{5})', re.I)
+ORDER_FIELD = re.compile(r'Order\s*Number\s*:\s*(\S*)', re.I)
+ORDER_ID = re.compile(r'[A-Z0-9]{8}-[A-Z0-9]{6}-[A-Z0-9]{5}', re.I | re.ASCII)
 PAGINATION = re.compile(r'Page\s*(\d+)\s*of\s*(\d+)', re.I)
 CITY = re.compile(r'^.+,\s*[A-Z]{2}\s+\d{5}(?:-\d{4})?$')
 # 4x6 in label media, in PDF points.
@@ -70,7 +71,7 @@ def address(page):
     result = lines[:city+1]
     if len(lines)>city+1 and lines[city+1].upper() in {'UNITED STATES','UNITED STATES OF AMERICA','USA','US'}:
         result.append(lines[city+1])
-    if any(ORDER.search(s) or 'Quantity' in s or 'Shipping Method' in s for s in result):
+    if any(ORDER_FIELD.search(s) or 'Quantity' in s or 'Shipping Method' in s for s in result):
         raise ValueError('Address block contains non-address text')
     return result
 
@@ -83,10 +84,15 @@ def parse(path):
     with pdfplumber.open(path) as pdf:
         for index,page in enumerate(pdf.pages):
             text = page.extract_text(x_tolerance=.5) or ''
-            ids = set(ORDER.findall(text))
+            # Capture every field before validation: a malformed header must not
+            # disappear just because another field contains a valid order ID.
+            fields = ORDER_FIELD.findall(text)
+            if any(not ORDER_ID.fullmatch(value) for value in fields):
+                raise ValueError(f'Page {index+1} does not identify exactly one order')
+            ids = {value.upper() for value in fields}
             if len(ids)!=1:
                 raise ValueError(f'Page {index+1} does not identify exactly one order')
-            oid = ids.pop().upper()
+            oid = ids.pop()
             pg = PAGINATION.findall(text)
             if len(pg)!=1:
                 raise ValueError(f'Page {index+1} does not identify its native page count')
@@ -101,7 +107,8 @@ def parse(path):
         for g in groups.values():
             nums = g['pagination']
             total = nums[0][1]
-            if nums != [(n,total) for n in range(1,total+1)] or g['address'] is None:
+            # Bound work by the pages actually present, not an untrusted count.
+            if len(nums)!=total or nums != [(n,total) for n in range(1,total+1)] or g['address'] is None:
                 raise ValueError('Missing, repeated or out-of-order native continuation page')
     return list(groups.values())
 
@@ -117,7 +124,8 @@ def label(lines, return_lines, oid):
     c.setLineWidth(.5); c.rect(350,217,64,53)
     c.setFont('Helvetica',8); c.drawCentredString(382,241,'AFFIX STAMP')
     size=20
-    while max(stringWidth(s,'Helvetica-Bold' if i==0 else 'Helvetica',size) for i,s in enumerate(lines))>388 and size>11:
+    while size>11 and (153-size*1.25*len(lines)<22 or
+                      max(stringWidth(s,'Helvetica-Bold' if i==0 else 'Helvetica',size) for i,s in enumerate(lines))>388):
         size-=.5
     if max(stringWidth(s,'Helvetica-Bold' if i==0 else 'Helvetica',size) for i,s in enumerate(lines))>388:
         raise ValueError('Address exceeds printable label width')
@@ -131,22 +139,28 @@ def label(lines, return_lines, oid):
     return PdfReader(stream).pages[0]
 
 def build(source, output, groups, config):
-    reader=PdfReader(source); writer=PdfWriter()
-    for g in groups:
-        for index in g['pages']:
-            p=reader.pages[index]
-            if p.rotation: p.transfer_rotation_to_content()
-            w,h=float(p.mediabox.width),float(p.mediabox.height)
-            scale=min((LABEL_W-6)/w,(LABEL_H-6)/h)
-            x,y=(LABEL_W-w*scale)/2,(LABEL_H-h*scale)/2
-            blank=writer.add_blank_page(width=LABEL_W,height=LABEL_H)
-            blank.merge_transformed_page(p,Transformation().scale(scale).translate(x,y))
-        writer.add_page(label(g['address'], config['return_address'],g['id']))
-    output=Path(output); output.parent.mkdir(parents=True,exist_ok=True)
-    temp=output.with_suffix('.tmp')
-    with open(temp,'wb') as stream: writer.write(stream)
-    os.replace(temp,output)
-    os.chmod(output,0o600)
+    with PdfReader(source) as reader, PdfWriter() as writer:
+        for g in groups:
+            for index in g['pages']:
+                p=reader.pages[index]
+                if p.rotation: p.transfer_rotation_to_content()
+                w,h=float(p.mediabox.width),float(p.mediabox.height)
+                scale=min((LABEL_W-6)/w,(LABEL_H-6)/h)
+                x,y=(LABEL_W-w*scale)/2,(LABEL_H-h*scale)/2
+                blank=writer.add_blank_page(width=LABEL_W,height=LABEL_H)
+                blank.merge_transformed_page(p,Transformation().scale(scale).translate(x,y))
+            writer.add_page(label(g['address'], config['return_address'],g['id']))
+        output=Path(output); output.parent.mkdir(parents=True,exist_ok=True)
+        # Keep buyer addresses private before the final atomic rename too.
+        fd,name=tempfile.mkstemp(prefix=f'.{output.name}-',suffix='.tmp',dir=output.parent)
+        temp=Path(name)
+        try:
+            with os.fdopen(fd,'wb') as stream:
+                os.fchmod(stream.fileno(),0o600)
+                writer.write(stream)
+            os.replace(temp,output)
+        finally:
+            temp.unlink(missing_ok=True)
     return output
 
 def validate_config(conf):
