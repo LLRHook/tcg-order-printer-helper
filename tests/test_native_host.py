@@ -64,9 +64,59 @@ class HostTest(unittest.TestCase):
         self.assertEqual(out[0]['error'],'PDF_ORDER_MISMATCH')
         self.mocks[1].assert_not_called()
 
+    def test_longer_pdf_order_id_cannot_print_as_a_prefix_match(self):
+        _,out=self.serve(self.print_message(slip(((ORDER_A+'X',1),))))
+        self.assertEqual(out,[{'ok':False,'error':'UNSUPPORTED_PACKING_SLIP'}])
+        self.mocks[1].assert_not_called()
+
+    def test_invalid_json_and_utf8_allow_the_next_complete_frame(self):
+        for raw in (b'{',b'\xff'):
+            with self.subTest(raw=raw):
+                inp=io.BytesIO(struct.pack('=I',len(raw))+raw+frames({'command':'ping'}).getvalue())
+                out=io.BytesIO()
+                code=native_host.serve(ORIGIN,inp,out,self.state)
+                result=replies(out)
+                self.assertEqual(code,0)
+                self.assertEqual(result[0],{'ok':False,'error':'INVALID_MESSAGE'})
+                self.assertTrue(result[1]['ok'])
+        self.mocks[1].assert_not_called()
+
     def test_non_pdf_and_truncated_rejected(self):
         _,out=self.serve(self.print_message(b'hello'),self.print_message(slip(truncate=True)))
         self.assertEqual([o['error'] for o in out],['INVALID_OR_INCOMPLETE_PDF']*2)
+
+    def test_malformed_pdf_is_rejected_without_preventing_next_message(self):
+        code,out=self.serve(self.print_message(b'%PDF-1.4\n%%EOF\n'),{'command':'ping'})
+        self.assertEqual(code,0)
+        self.assertEqual(out[0],{'ok':False,'error':'UNSUPPORTED_PACKING_SLIP'})
+        self.assertTrue(out[1]['ok'])
+        self.mocks[1].assert_not_called()
+
+    def test_invalid_uuid_is_rejected_before_storing_pdf(self):
+        for token in ('-'*36,'a'*36,'12345678-1234-1234-1234-123456789ab-'):
+            with self.subTest(token=token):
+                _,out=self.serve(self.print_message(token=token))
+                self.assertEqual(out,[{'ok':False,'error':'INVALID_ORDER_REQUEST'}])
+        self.assertFalse((self.state/'inputs').exists())
+        self.mocks[1].assert_not_called()
+
+    def test_fragmented_headers_and_bodies_accept_multiple_messages(self):
+        class Fragmented(io.BytesIO):
+            def read(self,size=-1): return super().read(min(size,1) if size>=0 else 1)
+        out=io.BytesIO()
+        messages=frames({'command':'ping'},{'command':'ping'}).getvalue()
+        code=native_host.serve(ORIGIN,Fragmented(messages),out,self.state)
+        self.assertEqual(code,0)
+        self.assertEqual(len(replies(out)),2)
+        self.assertTrue(all(reply['ok'] for reply in replies(out)))
+
+    def test_truncated_frames_close_without_reply(self):
+        message=frames({'command':'ping'}).getvalue()
+        for size in (1,2,3,4,len(message)-1):
+            with self.subTest(size=size):
+                out=io.BytesIO()
+                code=native_host.serve(ORIGIN,io.BytesIO(message[:size]),out,self.state)
+                self.assertEqual((code,replies(out)),(1,[]))
 
     def test_unresolved_prior_job_blocks_new_click(self):
         self.mocks[2].return_value={'job-state':5}
